@@ -43,37 +43,62 @@ def find_account(account_id):
 # ─────────────────────────────────────────────────────────────
 # 1. POST /register — Đăng ký tài khoản
 # Frontend gửi: {id, name, password, email, createdAt, assignedKey, device}
+# Chặn trùng: cùng tên + cùng IP, hoặc trùng email
 # ─────────────────────────────────────────────────────────────
+def _get_client_ip():
+    fwd = request.headers.get('X-Forwarded-For', '')
+    if fwd:
+        return fwd.split(',')[0].strip()
+    return request.remote_addr or 'unknown'
+
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json or {}
     acc_id = data.get('id')
-    name = data.get('name')
-    email = data.get('email')
+    name = (data.get('name') or '').strip()
+    email = (data.get('email') or '').strip().lower()
+    client_ip = _get_client_ip()
 
     if not acc_id or not name:
         return jsonify({'error': 'Thiếu id hoặc name'}), 400
 
-    # Nếu id đã tồn tại (đăng ký lại từ cùng máy) -> cập nhật thay vì trùng lỗi
     existing = find_account(acc_id)
     if existing:
+        # Đăng ký lại từ đúng máy/tài khoản cũ -> cập nhật, không tính là trùng
         existing.update({
             'name': name,
             'email': email,
             'password': data.get('password'),
             'device': data.get('device'),
+            'ip': client_ip,
         })
-    else:
-        DB['accounts'].append({
-            'id': acc_id,
-            'name': name,
-            'password': data.get('password'),
-            'email': email,
-            'createdAt': data.get('createdAt', int(time.time() * 1000)),
-            'assignedKey': None,
-            'assignedAt': None,
-            'device': data.get('device'),
-        })
+        _save(DB)
+        return jsonify({'message': 'Registered successfully'}), 201
+
+    # Chặn trùng tên + IP (cùng người đăng ký nhiều lần)
+    dup_name_ip = next((a for a in DB['accounts']
+                         if a.get('name', '').strip().lower() == name.lower()
+                         and a.get('ip') == client_ip), None)
+    if dup_name_ip:
+        return jsonify({'error': 'Tên này đã đăng ký từ thiết bị/mạng của bạn rồi!'}), 409
+
+    # Chặn trùng email
+    dup_email = next((a for a in DB['accounts']
+                       if a.get('email', '').strip().lower() == email and email), None)
+    if dup_email:
+        return jsonify({'error': 'Email này đã được đăng ký!'}), 409
+
+    DB['accounts'].append({
+        'id': acc_id,
+        'name': name,
+        'password': data.get('password'),
+        'email': email,
+        'createdAt': data.get('createdAt', int(time.time() * 1000)),
+        'assignedKey': None,
+        'assignedAt': None,
+        'device': data.get('device'),
+        'ip': client_ip,
+    })
 
     _save(DB)
     return jsonify({'message': 'Registered successfully'}), 201
@@ -222,6 +247,22 @@ def login():
             return jsonify({'success': True, 'account': acc}), 200
 
     return jsonify({'success': False, 'error': 'Sai email hoặc mật khẩu'}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 9. POST /delete-account — Admin xoá 1 tài khoản (dọn trùng lặp...)
+# Frontend gửi: {accountId}
+# ─────────────────────────────────────────────────────────────
+@app.route('/delete-account', methods=['POST'])
+def delete_account():
+    data = request.json or {}
+    account_id = data.get('accountId')
+    before = len(DB['accounts'])
+    DB['accounts'] = [a for a in DB['accounts'] if a.get('id') != account_id]
+    if len(DB['accounts']) == before:
+        return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
+    _save(DB)
+    return jsonify({'message': 'Deleted'}), 200
 
 
 if __name__ == '__main__':
