@@ -205,5 +205,24 @@ def set_status():
     return jsonify(DB['maintenance']), 200
 
 
+# ─────────────────────────────────────────────────────────────
+# 8. POST /login — Đăng nhập bằng email + mật khẩu (đăng nhập
+# từ thiết bị khác với thiết bị đã đăng ký)
+# Frontend gửi: {email, password}
+# Cần trả: {success: bool, account: {...}}
+# ─────────────────────────────────────────────────────────────
+@app.route('/login', methods=['POST'])
+def login():
+    data = request.json or {}
+    email = data.get('email')
+    password = data.get('password')
+
+    for acc in DB['accounts']:
+        if acc.get('email') == email and acc.get('password') == password:
+            return jsonify({'success': True, 'account': acc}), 200
+
+    return jsonify({'success': False, 'error': 'Sai email hoặc mật khẩu'}), 200
+
+
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=5000)
