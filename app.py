@@ -18,10 +18,14 @@ def _load():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                return json.load(f)
+                d = json.load(f)
+                d.setdefault('accounts', [])
+                d.setdefault('keys', {})
+                d.setdefault('maintenance', {'locked': False, 'message': ''})
+                return d
         except Exception:
             pass
-    return {'accounts': [], 'maintenance': {'locked': False, 'message': ''}}
+    return {'accounts': [], 'keys': {}, 'maintenance': {'locked': False, 'message': ''}}
 
 def _save(data):
     try:
@@ -124,6 +128,7 @@ def assign_key():
     account_id = data.get('accountId')
     key = data.get('key')
     exp = data.get('exp')
+    max_devices = int(data.get('maxDevices', 1) or 1)
 
     acc = find_account(account_id)
     if not acc:
@@ -133,8 +138,38 @@ def assign_key():
     acc['assignedAt'] = int(time.time() * 1000)
     acc['keyExpiry'] = exp
 
+    DB['keys'][key] = {
+        'exp': exp, 'user': acc.get('name'), 'created': int(time.time() * 1000),
+        'accountId': account_id, 'maxDevices': max_devices, 'devices': []
+    }
+
     _save(DB)
     return jsonify({'message': 'Key assigned', 'key': key}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 3b. POST /create-key — Admin tạo key rời (nút "TẠO KEY MỚI",
+# không gắn tài khoản cụ thể). Ghi vào kho key thống nhất để
+# MỌI thiết bị đều biết hạn thật của key này.
+# Frontend gửi: {key, user, exp, maxDevices}
+# ─────────────────────────────────────────────────────────────
+@app.route('/create-key', methods=['POST'])
+def create_key():
+    data = request.json or {}
+    key = data.get('key')
+    if not key:
+        return jsonify({'error': 'Thiếu key'}), 400
+
+    DB['keys'][key] = {
+        'exp': data.get('exp'),
+        'user': data.get('user', ''),
+        'created': int(time.time() * 1000),
+        'accountId': None,
+        'maxDevices': int(data.get('maxDevices', 1) or 1),
+        'devices': []
+    }
+    _save(DB)
+    return jsonify({'message': 'Key created', 'key': key}), 201
 
 
 # ─────────────────────────────────────────────────────────────
@@ -191,17 +226,36 @@ KEY_DURATIONS = {
 def verify_key():
     data = request.json or {}
     key = (data.get('key') or '').strip().upper()
+    device = data.get('device')
+    now = int(time.time() * 1000)
 
-    # Nếu key này từng được cấp qua /assign-key -> kiểm tra hạn thật
-    for acc in DB['accounts']:
-        if acc.get('assignedKey') == key:
-            exp = acc.get('keyExpiry')
-            if exp and exp <= int(time.time() * 1000):
-                return jsonify({'valid': False, 'error': 'Key đã hết hạn'}), 200
-            return jsonify({'valid': True, 'days': 1}), 200
+    # 1. Key nằm trong kho thống nhất (tạo qua admin, dù rời hay gắn tài khoản)
+    #    -> đây là nguồn xác thực CHÍNH, luôn ưu tiên kiểm tra trước.
+    rec = DB['keys'].get(key)
+    if rec:
+        exp = rec.get('exp')
+        if exp and exp <= now:
+            return jsonify({'valid': False, 'error': 'Key đã hết hạn'}), 200
 
-    # Không tìm thấy trong hệ thống cấp key -> kiểm tra định dạng
-    # SHADOW-<GÓI>-<MÃ> để không chặn các key admin tạo local (cũ)
+        max_devices = int(rec.get('maxDevices', 1) or 1)
+        devices = rec.get('devices')
+        if devices is None:
+            # Key cũ tạo trước khi có tính năng nhiều thiết bị -> chuyển đổi
+            devices = [rec['device']] if rec.get('device') else []
+            rec['devices'] = devices
+
+        if device:
+            if device not in devices:
+                if len(devices) >= max_devices:
+                    return jsonify({'valid': False, 'error': 'Key đã đạt giới hạn '+str(max_devices)+' thiết bị!'}), 200
+                devices.append(device)
+                _save(DB)
+
+        days_left = max((exp - now) / 86400000, 0) if exp else 36500
+        return jsonify({'valid': True, 'days': days_left, 'devicesUsed': len(devices), 'maxDevices': max_devices}), 200
+
+    # 2. Không có trong kho (key rất cũ, tạo trước khi có bản đồng bộ này)
+    #    -> chỉ còn cách kiểm tra định dạng, KHÔNG thể biết hạn thật.
     m = re.match(r'^SHADOW-([A-Z0-9]+)-[A-Z0-9]+$', key)
     if m:
         plan = m.group(1)
