@@ -1,126 +1,214 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import json, os, time, re
+import os, time, re, json
+import psycopg2
+import psycopg2.extras
 
 app = Flask(__name__)
 CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v.)
 
 # ═══════════════════════════════════════════════════════════════
-# LƯU DỮ LIỆU RA FILE JSON — sống sót qua các lần request trong
-# cùng 1 lần chạy service. LƯU Ý: Render free tier KHÔNG có ổ đĩa
-# bền vững — mỗi lần deploy lại / service ngủ rồi thức dậy lại có
-# thể bị mất file này. Nếu cần dữ liệu không bao giờ mất, nên
-# chuyển sang Render Postgres (free tier có) thay vì file JSON.
+# LƯU DỮ LIỆU VÀO POSTGRES — bền vững thật sự, KHÔNG mất khi
+# service Render deploy lại / ngủ rồi thức dậy (khác với file JSON
+# trước đây, chỉ sống trong ổ đĩa tạm của lần chạy đó).
+#
+# CẦN LÀM TRÊN RENDER (1 lần duy nhất):
+#   1. Vào Render Dashboard → New → PostgreSQL (free tier)
+#   2. Tạo xong, Render cho 1 "Internal Database URL"
+#   3. Vào Web Service (service chạy app.py này) → Environment
+#      → thêm biến DATABASE_URL = <Internal Database URL vừa copy>
+#   4. Deploy lại — app sẽ tự tạo bảng ở lần chạy đầu tiên.
+#
+# Nếu CHƯA gắn DATABASE_URL, app vẫn chạy được bằng file JSON tạm
+# (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
+# Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATA_FILE = 'data.json'
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
-def _load():
-    if os.path.exists(DATA_FILE):
+USE_DB = bool(DATABASE_URL)
+
+if USE_DB:
+    # Render đôi khi cấp URL dạng "postgres://" — psycopg2 cần "postgresql://"
+    if DATABASE_URL.startswith('postgres://'):
+        DATABASE_URL = DATABASE_URL.replace('postgres://', 'postgresql://', 1)
+
+    def get_conn():
+        return psycopg2.connect(DATABASE_URL)
+
+    def init_db():
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS accounts (
+                id TEXT PRIMARY KEY,
+                name TEXT,
+                password TEXT,
+                email TEXT,
+                created_at BIGINT,
+                assigned_key TEXT,
+                assigned_at BIGINT,
+                key_expiry BIGINT,
+                device TEXT,
+                ip TEXT
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS keys_store (
+                key TEXT PRIMARY KEY,
+                exp BIGINT,
+                user_name TEXT,
+                created BIGINT,
+                account_id TEXT,
+                max_devices INT DEFAULT 1,
+                devices JSONB DEFAULT '[]'::jsonb
+            )
+        ''')
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS settings (
+                id INT PRIMARY KEY DEFAULT 1,
+                locked BOOLEAN DEFAULT FALSE,
+                message TEXT DEFAULT ''
+            )
+        ''')
+        cur.execute('INSERT INTO settings (id, locked, message) VALUES (1, FALSE, %s) ON CONFLICT (id) DO NOTHING', ('',))
+        conn.commit()
+        cur.close()
+        conn.close()
+
+    init_db()
+
+    def _acc_row_to_dict(r):
+        return {
+            'id': r['id'], 'name': r['name'], 'password': r['password'], 'email': r['email'],
+            'createdAt': r['created_at'], 'assignedKey': r['assigned_key'], 'assignedAt': r['assigned_at'],
+            'keyExpiry': r['key_expiry'], 'device': r['device'], 'ip': r['ip']
+        }
+
+else:
+    # ── Chế độ dự phòng: file JSON tạm (chỉ dùng khi chưa gắn DATABASE_URL) ──
+    DATA_FILE = 'data.json'
+
+    def _load():
+        if os.path.exists(DATA_FILE):
+            try:
+                with open(DATA_FILE, 'r', encoding='utf-8') as f:
+                    d = json.load(f)
+                    d.setdefault('accounts', [])
+                    d.setdefault('keys', {})
+                    d.setdefault('maintenance', {'locked': False, 'message': ''})
+                    return d
+            except Exception:
+                pass
+        return {'accounts': [], 'keys': {}, 'maintenance': {'locked': False, 'message': ''}}
+
+    def _save(data):
         try:
-            with open(DATA_FILE, 'r', encoding='utf-8') as f:
-                d = json.load(f)
-                d.setdefault('accounts', [])
-                d.setdefault('keys', {})
-                d.setdefault('maintenance', {'locked': False, 'message': ''})
-                return d
-        except Exception:
-            pass
-    return {'accounts': [], 'keys': {}, 'maintenance': {'locked': False, 'message': ''}}
+            with open(DATA_FILE, 'w', encoding='utf-8') as f:
+                json.dump(data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            print('[WARN] Không ghi được data.json:', e)
 
-def _save(data):
-    try:
-        with open(DATA_FILE, 'w', encoding='utf-8') as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        print('[WARN] Không ghi được data.json:', e)
-
-DB = _load()  # {'accounts': [...], 'maintenance': {...}}
+    JSONDB = _load()
 
 
-def find_account(account_id):
-    for acc in DB['accounts']:
-        if acc.get('id') == account_id:
-            return acc
-    return None
-
-
-# ─────────────────────────────────────────────────────────────
-# 1. POST /register — Đăng ký tài khoản
-# Frontend gửi: {id, name, password, email, createdAt, assignedKey, device}
-# Chặn trùng: cùng tên + cùng IP, hoặc trùng email
-# ─────────────────────────────────────────────────────────────
 def _get_client_ip():
     fwd = request.headers.get('X-Forwarded-For', '')
     if fwd:
         return fwd.split(',')[0].strip()
     return request.remote_addr or 'unknown'
 
+
+# ─────────────────────────────────────────────────────────────
+# 1. POST /register — Đăng ký tài khoản
+# Chặn trùng: cùng tên + cùng IP, hoặc trùng email
+# ─────────────────────────────────────────────────────────────
 @app.route('/register', methods=['POST'])
 def register():
     data = request.json or {}
     acc_id = data.get('id')
     name = (data.get('name') or '').strip()
     email = (data.get('email') or '').strip().lower()
+    password = data.get('password')
+    device = data.get('device')
     client_ip = _get_client_ip()
 
     if not acc_id or not name:
         return jsonify({'error': 'Thiếu id hoặc name'}), 400
 
-    existing = find_account(acc_id)
-    if existing:
-        # Đăng ký lại từ đúng máy/tài khoản cũ -> cập nhật, không tính là trùng
-        existing.update({
-            'name': name,
-            'email': email,
-            'password': data.get('password'),
-            'device': data.get('device'),
-            'ip': client_ip,
-        })
-        _save(DB)
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+
+        cur.execute('SELECT * FROM accounts WHERE id=%s', (acc_id,))
+        existing = cur.fetchone()
+        if existing:
+            cur.execute('''UPDATE accounts SET name=%s, email=%s, password=%s, device=%s, ip=%s WHERE id=%s''',
+                        (name, email, password, device, client_ip, acc_id))
+            conn.commit(); cur.close(); conn.close()
+            return jsonify({'message': 'Registered successfully'}), 201
+
+        cur.execute('SELECT 1 FROM accounts WHERE LOWER(name)=%s AND ip=%s', (name.lower(), client_ip))
+        if cur.fetchone():
+            cur.close(); conn.close()
+            return jsonify({'error': 'Tên này đã đăng ký từ thiết bị/mạng của bạn rồi!'}), 409
+
+        if email:
+            cur.execute('SELECT 1 FROM accounts WHERE LOWER(email)=%s', (email,))
+            if cur.fetchone():
+                cur.close(); conn.close()
+                return jsonify({'error': 'Email này đã được đăng ký!'}), 409
+
+        cur.execute('''INSERT INTO accounts (id, name, password, email, created_at, assigned_key, assigned_at, key_expiry, device, ip)
+                        VALUES (%s,%s,%s,%s,%s,NULL,NULL,NULL,%s,%s)''',
+                    (acc_id, name, password, email, data.get('createdAt', int(time.time()*1000)), device, client_ip))
+        conn.commit(); cur.close(); conn.close()
         return jsonify({'message': 'Registered successfully'}), 201
 
-    # Chặn trùng tên + IP (cùng người đăng ký nhiều lần)
-    dup_name_ip = next((a for a in DB['accounts']
-                         if a.get('name', '').strip().lower() == name.lower()
-                         and a.get('ip') == client_ip), None)
-    if dup_name_ip:
-        return jsonify({'error': 'Tên này đã đăng ký từ thiết bị/mạng của bạn rồi!'}), 409
+    else:
+        existing = next((a for a in JSONDB['accounts'] if a.get('id') == acc_id), None)
+        if existing:
+            existing.update({'name': name, 'email': email, 'password': password, 'device': device, 'ip': client_ip})
+            _save(JSONDB)
+            return jsonify({'message': 'Registered successfully'}), 201
 
-    # Chặn trùng email
-    dup_email = next((a for a in DB['accounts']
-                       if a.get('email', '').strip().lower() == email and email), None)
-    if dup_email:
-        return jsonify({'error': 'Email này đã được đăng ký!'}), 409
+        dup_name_ip = next((a for a in JSONDB['accounts']
+                             if a.get('name', '').strip().lower() == name.lower() and a.get('ip') == client_ip), None)
+        if dup_name_ip:
+            return jsonify({'error': 'Tên này đã đăng ký từ thiết bị/mạng của bạn rồi!'}), 409
 
-    DB['accounts'].append({
-        'id': acc_id,
-        'name': name,
-        'password': data.get('password'),
-        'email': email,
-        'createdAt': data.get('createdAt', int(time.time() * 1000)),
-        'assignedKey': None,
-        'assignedAt': None,
-        'device': data.get('device'),
-        'ip': client_ip,
-    })
+        dup_email = next((a for a in JSONDB['accounts']
+                           if a.get('email', '').strip().lower() == email and email), None)
+        if dup_email:
+            return jsonify({'error': 'Email này đã được đăng ký!'}), 409
 
-    _save(DB)
-    return jsonify({'message': 'Registered successfully'}), 201
+        JSONDB['accounts'].append({
+            'id': acc_id, 'name': name, 'password': password, 'email': email,
+            'createdAt': data.get('createdAt', int(time.time()*1000)),
+            'assignedKey': None, 'assignedAt': None, 'device': device, 'ip': client_ip,
+        })
+        _save(JSONDB)
+        return jsonify({'message': 'Registered successfully'}), 201
 
 
 # ─────────────────────────────────────────────────────────────
 # 2. GET /accounts — Admin lấy toàn bộ danh sách tài khoản
-# Frontend cần đúng dạng {"accounts": [...]}
 # ─────────────────────────────────────────────────────────────
 @app.route('/accounts', methods=['GET'])
 def get_accounts():
-    accs = sorted(DB['accounts'], key=lambda a: a.get('createdAt', 0), reverse=True)
-    return jsonify({'accounts': accs}), 200
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM accounts ORDER BY created_at DESC')
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        return jsonify({'accounts': [_acc_row_to_dict(r) for r in rows]}), 200
+    else:
+        accs = sorted(JSONDB['accounts'], key=lambda a: a.get('createdAt', 0), reverse=True)
+        return jsonify({'accounts': accs}), 200
 
 
 # ─────────────────────────────────────────────────────────────
 # 3. POST /assign-key — Admin cấp key cho 1 tài khoản
-# Frontend gửi: {accountId, key, exp}
 # ─────────────────────────────────────────────────────────────
 @app.route('/assign-key', methods=['POST'])
 def assign_key():
@@ -130,28 +218,39 @@ def assign_key():
     exp = data.get('exp')
     max_devices = int(data.get('maxDevices', 1) or 1)
 
-    acc = find_account(account_id)
-    if not acc:
-        return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM accounts WHERE id=%s', (account_id,))
+        acc = cur.fetchone()
+        if not acc:
+            cur.close(); conn.close()
+            return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
 
-    acc['assignedKey'] = key
-    acc['assignedAt'] = int(time.time() * 1000)
-    acc['keyExpiry'] = exp
-
-    DB['keys'][key] = {
-        'exp': exp, 'user': acc.get('name'), 'created': int(time.time() * 1000),
-        'accountId': account_id, 'maxDevices': max_devices, 'devices': []
-    }
-
-    _save(DB)
-    return jsonify({'message': 'Key assigned', 'key': key}), 200
+        now = int(time.time()*1000)
+        cur.execute('UPDATE accounts SET assigned_key=%s, assigned_at=%s, key_expiry=%s WHERE id=%s',
+                    (key, now, exp, account_id))
+        cur.execute('''INSERT INTO keys_store (key, exp, user_name, created, account_id, max_devices, devices)
+                        VALUES (%s,%s,%s,%s,%s,%s,'[]'::jsonb)
+                        ON CONFLICT (key) DO UPDATE SET exp=EXCLUDED.exp, max_devices=EXCLUDED.max_devices''',
+                    (key, exp, acc['name'], now, account_id, max_devices))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({'message': 'Key assigned', 'key': key}), 200
+    else:
+        acc = next((a for a in JSONDB['accounts'] if a.get('id') == account_id), None)
+        if not acc:
+            return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
+        acc['assignedKey'] = key
+        acc['assignedAt'] = int(time.time()*1000)
+        acc['keyExpiry'] = exp
+        JSONDB['keys'][key] = {'exp': exp, 'user': acc.get('name'), 'created': int(time.time()*1000),
+                                'accountId': account_id, 'maxDevices': max_devices, 'devices': []}
+        _save(JSONDB)
+        return jsonify({'message': 'Key assigned', 'key': key}), 200
 
 
 # ─────────────────────────────────────────────────────────────
-# 3b. POST /create-key — Admin tạo key rời (nút "TẠO KEY MỚI",
-# không gắn tài khoản cụ thể). Ghi vào kho key thống nhất để
-# MỌI thiết bị đều biết hạn thật của key này.
-# Frontend gửi: {key, user, exp, maxDevices}
+# 3b. POST /create-key — Admin tạo key rời (không gắn tài khoản)
 # ─────────────────────────────────────────────────────────────
 @app.route('/create-key', methods=['POST'])
 def create_key():
@@ -159,136 +258,169 @@ def create_key():
     key = data.get('key')
     if not key:
         return jsonify({'error': 'Thiếu key'}), 400
+    exp = data.get('exp')
+    max_devices = int(data.get('maxDevices', 1) or 1)
+    user = data.get('user', '')
 
-    DB['keys'][key] = {
-        'exp': data.get('exp'),
-        'user': data.get('user', ''),
-        'created': int(time.time() * 1000),
-        'accountId': None,
-        'maxDevices': int(data.get('maxDevices', 1) or 1),
-        'devices': []
-    }
-    _save(DB)
-    return jsonify({'message': 'Key created', 'key': key}), 201
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('''INSERT INTO keys_store (key, exp, user_name, created, account_id, max_devices, devices)
+                        VALUES (%s,%s,%s,%s,NULL,%s,'[]'::jsonb)
+                        ON CONFLICT (key) DO UPDATE SET exp=EXCLUDED.exp, max_devices=EXCLUDED.max_devices''',
+                    (key, exp, user, int(time.time()*1000), max_devices))
+        conn.commit(); cur.close(); conn.close()
+        return jsonify({'message': 'Key created', 'key': key}), 201
+    else:
+        JSONDB['keys'][key] = {'exp': exp, 'user': user, 'created': int(time.time()*1000),
+                                'accountId': None, 'maxDevices': max_devices, 'devices': []}
+        _save(JSONDB)
+        return jsonify({'message': 'Key created', 'key': key}), 201
 
 
 # ─────────────────────────────────────────────────────────────
 # 4. GET /my-account?id=... — User tự kiểm tra tài khoản của mình
-# Frontend cần field "assignedKey" (không phải "key")
 # ─────────────────────────────────────────────────────────────
 @app.route('/my-account', methods=['GET'])
 def my_account():
     account_id = request.args.get('id')
-    acc = find_account(account_id)
-    if not acc:
-        return jsonify({'error': 'Account not found'}), 404
-
-    return jsonify({
-        'id': acc['id'],
-        'name': acc['name'],
-        'assignedKey': acc.get('assignedKey')
-    }), 200
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT id, name, assigned_key FROM accounts WHERE id=%s', (account_id,))
+        acc = cur.fetchone()
+        cur.close(); conn.close()
+        if not acc:
+            return jsonify({'error': 'Account not found'}), 404
+        return jsonify({'id': acc['id'], 'name': acc['name'], 'assignedKey': acc['assigned_key']}), 200
+    else:
+        acc = next((a for a in JSONDB['accounts'] if a.get('id') == account_id), None)
+        if not acc:
+            return jsonify({'error': 'Account not found'}), 404
+        return jsonify({'id': acc['id'], 'name': acc['name'], 'assignedKey': acc.get('assignedKey')}), 200
 
 
 # ─────────────────────────────────────────────────────────────
-# 5. GET /inbox?device=... — Hộp thư: trả các key đã cấp cho
-# những tài khoản đăng ký TỪ thiết bị này.
-# Frontend cần dạng {"keys": [{id, key, note, orderId}]}
+# 5. GET /inbox?device=... — Hộp thư: key đã cấp cho tài khoản
+# đăng ký TỪ thiết bị này.
 # ─────────────────────────────────────────────────────────────
 @app.route('/inbox', methods=['GET'])
 def inbox():
     device = request.args.get('device')
     out = []
-    for acc in DB['accounts']:
-        if acc.get('device') == device and acc.get('assignedKey'):
-            out.append({
-                'id': 'ACCKEY_' + acc['id'],
-                'key': acc['assignedKey'],
-                'note': '🎁 Admin đã cấp key cho tài khoản "' + acc['name'] + '"',
-                'orderId': ''
-            })
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT id, name, assigned_key FROM accounts WHERE device=%s AND assigned_key IS NOT NULL', (device,))
+        for acc in cur.fetchall():
+            out.append({'id': 'ACCKEY_'+acc['id'], 'key': acc['assigned_key'],
+                        'note': '🎁 Admin đã cấp key cho tài khoản "'+acc['name']+'"', 'orderId': ''})
+        cur.close(); conn.close()
+    else:
+        for acc in JSONDB['accounts']:
+            if acc.get('device') == device and acc.get('assignedKey'):
+                out.append({'id': 'ACCKEY_'+acc['id'], 'key': acc['assignedKey'],
+                            'note': '🎁 Admin đã cấp key cho tài khoản "'+acc['name']+'"', 'orderId': ''})
     return jsonify({'keys': out}), 200
 
 
 # ─────────────────────────────────────────────────────────────
 # 6. POST /verify-key — Xác thực key khi kích hoạt / gia hạn
-# Frontend gửi: {key, device}  →  cần trả {valid: bool, days: number}
-# Vì hệ thống tạo key hiện tại vẫn chạy local trên máy admin (chưa
-# đồng bộ key string lên server), route này CHỈ kiểm tra định dạng
-# + kiểm tra nếu key đó từng được /assign-key cấp thì còn hạn không.
 # ─────────────────────────────────────────────────────────────
-KEY_DURATIONS = {
-    '1GIO': 1/24, '12GIO': 0.5, '1DAY': 1, '4DAY': 4,
-    '1TUAN': 7, '1THANG': 30,
-}
+KEY_DURATIONS = {'1GIO': 1/24, '12GIO': 0.5, '1DAY': 1, '4DAY': 4, '1TUAN': 7, '1THANG': 30}
 
 @app.route('/verify-key', methods=['POST'])
 def verify_key():
     data = request.json or {}
     key = (data.get('key') or '').strip().upper()
     device = data.get('device')
-    now = int(time.time() * 1000)
+    now = int(time.time()*1000)
 
-    # 1. Key nằm trong kho thống nhất (tạo qua admin, dù rời hay gắn tài khoản)
-    #    -> đây là nguồn xác thực CHÍNH, luôn ưu tiên kiểm tra trước.
-    rec = DB['keys'].get(key)
-    if rec:
-        exp = rec.get('exp')
-        if exp and exp <= now:
-            return jsonify({'valid': False, 'error': 'Key đã hết hạn'}), 200
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM keys_store WHERE key=%s', (key,))
+        rec = cur.fetchone()
+        if rec:
+            exp = rec['exp']
+            if exp and exp <= now:
+                cur.close(); conn.close()
+                return jsonify({'valid': False, 'error': 'Key đã hết hạn'}), 200
 
-        max_devices = int(rec.get('maxDevices', 1) or 1)
-        devices = rec.get('devices')
-        if devices is None:
-            # Key cũ tạo trước khi có tính năng nhiều thiết bị -> chuyển đổi
-            devices = [rec['device']] if rec.get('device') else []
-            rec['devices'] = devices
+            max_devices = rec['max_devices'] or 1
+            devices = rec['devices'] or []
+            if device and device not in devices:
+                if len(devices) >= max_devices:
+                    cur.close(); conn.close()
+                    return jsonify({'valid': False, 'error': 'Key đã đạt giới hạn '+str(max_devices)+' thiết bị!'}), 200
+                devices.append(device)
+                cur.execute('UPDATE keys_store SET devices=%s::jsonb WHERE key=%s', (json.dumps(devices), key))
+                conn.commit()
 
-        if device:
-            if device not in devices:
+            days_left = max((exp - now)/86400000, 0) if exp else 36500
+            cur.close(); conn.close()
+            return jsonify({'valid': True, 'days': days_left, 'devicesUsed': len(devices), 'maxDevices': max_devices}), 200
+        cur.close(); conn.close()
+    else:
+        rec = JSONDB['keys'].get(key)
+        if rec:
+            exp = rec.get('exp')
+            if exp and exp <= now:
+                return jsonify({'valid': False, 'error': 'Key đã hết hạn'}), 200
+            max_devices = int(rec.get('maxDevices', 1) or 1)
+            devices = rec.get('devices')
+            if devices is None:
+                devices = [rec['device']] if rec.get('device') else []
+                rec['devices'] = devices
+            if device and device not in devices:
                 if len(devices) >= max_devices:
                     return jsonify({'valid': False, 'error': 'Key đã đạt giới hạn '+str(max_devices)+' thiết bị!'}), 200
                 devices.append(device)
-                _save(DB)
+                _save(JSONDB)
+            days_left = max((exp - now)/86400000, 0) if exp else 36500
+            return jsonify({'valid': True, 'days': days_left, 'devicesUsed': len(devices), 'maxDevices': max_devices}), 200
 
-        days_left = max((exp - now) / 86400000, 0) if exp else 36500
-        return jsonify({'valid': True, 'days': days_left, 'devicesUsed': len(devices), 'maxDevices': max_devices}), 200
-
-    # 2. Không có trong kho (key rất cũ, tạo trước khi có bản đồng bộ này)
-    #    -> chỉ còn cách kiểm tra định dạng, KHÔNG thể biết hạn thật.
+    # Không có trong kho -> chỉ kiểm tra định dạng (key rất cũ / chưa đồng bộ)
     m = re.match(r'^SHADOW-([A-Z0-9]+)-[A-Z0-9]+$', key)
     if m:
-        plan = m.group(1)
-        days = KEY_DURATIONS.get(plan, 1)
+        days = KEY_DURATIONS.get(m.group(1), 1)
         return jsonify({'valid': True, 'days': days}), 200
-
     return jsonify({'valid': False, 'error': 'Key sai định dạng'}), 200
 
 
 # ─────────────────────────────────────────────────────────────
-# 7. GET /api/status — Trạng thái bảo trì
+# 7. GET/POST /api/status — Trạng thái bảo trì
 # ─────────────────────────────────────────────────────────────
 @app.route('/api/status', methods=['GET'])
 def api_status():
-    return jsonify(DB.get('maintenance', {'locked': False, 'message': ''})), 200
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT locked, message FROM settings WHERE id=1')
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        return jsonify({'locked': row['locked'], 'message': row['message']}), 200
+    else:
+        return jsonify(JSONDB.get('maintenance', {'locked': False, 'message': ''})), 200
 
 @app.route('/api/status', methods=['POST'])
 def set_status():
-    """Admin gọi route này để bật/tắt bảo trì (tuỳ chọn, có thể nối vào admin panel sau)."""
     data = request.json or {}
-    DB['maintenance'] = {
-        'locked': bool(data.get('locked', False)),
-        'message': data.get('message', '')
-    }
-    _save(DB)
-    return jsonify(DB['maintenance']), 200
+    locked = bool(data.get('locked', False))
+    message = data.get('message', '')
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('UPDATE settings SET locked=%s, message=%s WHERE id=1', (locked, message))
+        conn.commit(); cur.close(); conn.close()
+    else:
+        JSONDB['maintenance'] = {'locked': locked, 'message': message}
+        _save(JSONDB)
+    return jsonify({'locked': locked, 'message': message}), 200
 
 
 # ─────────────────────────────────────────────────────────────
-# 8. POST /login — Đăng nhập bằng email + mật khẩu (đăng nhập
-# từ thiết bị khác với thiết bị đã đăng ký)
-# Frontend gửi: {email, password}
-# Cần trả: {success: bool, account: {...}}
+# 8. POST /login — Đăng nhập bằng email + mật khẩu
 # ─────────────────────────────────────────────────────────────
 @app.route('/login', methods=['POST'])
 def login():
@@ -296,27 +428,47 @@ def login():
     email = data.get('email')
     password = data.get('password')
 
-    for acc in DB['accounts']:
-        if acc.get('email') == email and acc.get('password') == password:
-            return jsonify({'success': True, 'account': acc}), 200
-
-    return jsonify({'success': False, 'error': 'Sai email hoặc mật khẩu'}), 200
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM accounts WHERE email=%s AND password=%s', (email, password))
+        acc = cur.fetchone()
+        cur.close(); conn.close()
+        if acc:
+            return jsonify({'success': True, 'account': _acc_row_to_dict(acc)}), 200
+        return jsonify({'success': False, 'error': 'Sai email hoặc mật khẩu'}), 200
+    else:
+        for acc in JSONDB['accounts']:
+            if acc.get('email') == email and acc.get('password') == password:
+                return jsonify({'success': True, 'account': acc}), 200
+        return jsonify({'success': False, 'error': 'Sai email hoặc mật khẩu'}), 200
 
 
 # ─────────────────────────────────────────────────────────────
-# 9. POST /delete-account — Admin xoá 1 tài khoản (dọn trùng lặp...)
-# Frontend gửi: {accountId}
+# 9. POST /delete-account — Admin xoá 1 tài khoản
+# Đây là CÁCH DUY NHẤT 1 tài khoản bị mất — admin chủ động xoá.
 # ─────────────────────────────────────────────────────────────
 @app.route('/delete-account', methods=['POST'])
 def delete_account():
     data = request.json or {}
     account_id = data.get('accountId')
-    before = len(DB['accounts'])
-    DB['accounts'] = [a for a in DB['accounts'] if a.get('id') != account_id]
-    if len(DB['accounts']) == before:
-        return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
-    _save(DB)
-    return jsonify({'message': 'Deleted'}), 200
+
+    if USE_DB:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM accounts WHERE id=%s', (account_id,))
+        deleted = cur.rowcount
+        conn.commit(); cur.close(); conn.close()
+        if not deleted:
+            return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
+        return jsonify({'message': 'Deleted'}), 200
+    else:
+        before = len(JSONDB['accounts'])
+        JSONDB['accounts'] = [a for a in JSONDB['accounts'] if a.get('id') != account_id]
+        if len(JSONDB['accounts']) == before:
+            return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
+        _save(JSONDB)
+        return jsonify({'message': 'Deleted'}), 200
 
 
 if __name__ == '__main__':
