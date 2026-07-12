@@ -23,7 +23,7 @@ CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v
 # (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
 # Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get('https://tool-5.onrender.com/api/status', '')
+DATABASE_URL = os.environ.get('https://tool-6.onrender.com', '')
 
 USE_DB = bool(DATABASE_URL)
 DB_ERROR = None  # ghi lại lỗi kết nối DB nếu có, để /api/status báo cho biết
