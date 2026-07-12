@@ -23,9 +23,10 @@ CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v
 # (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
 # Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get('DATABASE_URL', '')
+DATABASE_URL = os.environ.get('https://tool-5.onrender.com/api/status', '')
 
 USE_DB = bool(DATABASE_URL)
+DB_ERROR = None  # ghi lại lỗi kết nối DB nếu có, để /api/status báo cho biết
 
 if USE_DB:
     # Render đôi khi cấp URL dạng "postgres://" — psycopg2 cần "postgresql://"
@@ -75,7 +76,14 @@ if USE_DB:
         cur.close()
         conn.close()
 
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        # QUAN TRỌNG: nếu kết nối Postgres lỗi (sai URL, DB chưa sẵn sàng...),
+        # KHÔNG được âm thầm rơi về JSON tạm — phải báo rõ qua /api/status
+        # để không ai tưởng nhầm là đang lưu bền vững trong khi thực ra không.
+        DB_ERROR = str(e)
+        print('[LỖI KẾT NỐI POSTGRES]', DB_ERROR)
 
     def _acc_row_to_dict(r):
         return {
@@ -393,15 +401,23 @@ def verify_key():
 # ─────────────────────────────────────────────────────────────
 @app.route('/api/status', methods=['GET'])
 def api_status():
-    if USE_DB:
+    diag = {
+        'storage': 'postgres' if (USE_DB and not DB_ERROR) else ('postgres-error' if USE_DB else 'json-fallback (KHONG BEN VUNG)'),
+        'dbError': DB_ERROR
+    }
+    if USE_DB and not DB_ERROR:
         conn = get_conn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute('SELECT locked, message FROM settings WHERE id=1')
         row = cur.fetchone()
+        cur.execute('SELECT COUNT(*) as c FROM accounts')
+        cnt = cur.fetchone()
         cur.close(); conn.close()
-        return jsonify({'locked': row['locked'], 'message': row['message']}), 200
+        diag['accountCount'] = cnt['c']
+        return jsonify(dict({'locked': row['locked'], 'message': row['message']}, **diag)), 200
     else:
-        return jsonify(JSONDB.get('maintenance', {'locked': False, 'message': ''})), 200
+        data = JSONDB.get('maintenance', {'locked': False, 'message': ''}) if not USE_DB else {'locked': False, 'message': ''}
+        return jsonify(dict(data, **diag)), 200
 
 @app.route('/api/status', methods=['POST'])
 def set_status():
