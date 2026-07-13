@@ -23,7 +23,7 @@ CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v
 # (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
 # Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get('https://tool-6.onrender.com', '')
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 USE_DB = bool(DATABASE_URL)
 DB_ERROR = None  # ghi lại lỗi kết nối DB nếu có, để /api/status báo cho biết
@@ -68,9 +68,16 @@ if USE_DB:
             CREATE TABLE IF NOT EXISTS settings (
                 id INT PRIMARY KEY DEFAULT 1,
                 locked BOOLEAN DEFAULT FALSE,
-                message TEXT DEFAULT ''
+                message TEXT DEFAULT '',
+                base_price BIGINT DEFAULT 33000,
+                sale_price BIGINT DEFAULT 0,
+                sale_expiry BIGINT
             )
         ''')
+        # Nếu bảng settings đã tồn tại từ trước (bản cũ chưa có cột giá) -> thêm cột
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS base_price BIGINT DEFAULT 33000")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS sale_price BIGINT DEFAULT 0")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS sale_expiry BIGINT")
         cur.execute('INSERT INTO settings (id, locked, message) VALUES (1, FALSE, %s) ON CONFLICT (id) DO NOTHING', ('',))
         conn.commit()
         cur.close()
@@ -433,6 +440,84 @@ def set_status():
         JSONDB['maintenance'] = {'locked': locked, 'message': message}
         _save(JSONDB)
     return jsonify({'locked': locked, 'message': message}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 7b. GET/POST /pricing — Giá key + sale (đồng bộ server để trang
+# admin riêng có thể chỉnh và tool chính tự cập nhật theo)
+# ─────────────────────────────────────────────────────────────
+@app.route('/pricing', methods=['GET'])
+def get_pricing():
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT base_price, sale_price, sale_expiry FROM settings WHERE id=1')
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        return jsonify({'base': row['base_price'], 'sale': row['sale_price'], 'saleExpiry': row['sale_expiry']}), 200
+    else:
+        p = JSONDB.get('pricing', {'base': 33000, 'sale': 0, 'saleExpiry': None}) if not USE_DB else {'base': 33000, 'sale': 0, 'saleExpiry': None}
+        return jsonify(p), 200
+
+@app.route('/pricing', methods=['POST'])
+def set_pricing():
+    data = request.json or {}
+    base = int(data.get('base', 33000) or 33000)
+    sale = int(data.get('sale', 0) or 0)
+    sale_expiry = data.get('saleExpiry')
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('UPDATE settings SET base_price=%s, sale_price=%s, sale_expiry=%s WHERE id=1', (base, sale, sale_expiry))
+        conn.commit(); cur.close(); conn.close()
+    else:
+        JSONDB['pricing'] = {'base': base, 'sale': sale, 'saleExpiry': sale_expiry}
+        _save(JSONDB)
+    return jsonify({'base': base, 'sale': sale, 'saleExpiry': sale_expiry}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 7c. GET /keys — Admin lấy toàn bộ danh sách key đã tạo/cấp
+# ─────────────────────────────────────────────────────────────
+@app.route('/keys', methods=['GET'])
+def get_keys():
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT * FROM keys_store ORDER BY created DESC')
+        rows = cur.fetchall()
+        cur.close(); conn.close()
+        keys = [{'key': r['key'], 'exp': r['exp'], 'user': r['user_name'], 'created': r['created'],
+                 'accountId': r['account_id'], 'maxDevices': r['max_devices'], 'devices': r['devices']} for r in rows]
+        return jsonify({'keys': keys}), 200
+    else:
+        keys = [dict(v, key=k) for k, v in JSONDB.get('keys', {}).items()] if not USE_DB else []
+        keys.sort(key=lambda x: x.get('created', 0), reverse=True)
+        return jsonify({'keys': keys}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 7d. POST /delete-key — Admin xoá 1 key khỏi kho
+# ─────────────────────────────────────────────────────────────
+@app.route('/delete-key', methods=['POST'])
+def delete_key():
+    data = request.json or {}
+    key = data.get('key')
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute('DELETE FROM keys_store WHERE key=%s', (key,))
+        deleted = cur.rowcount
+        conn.commit(); cur.close(); conn.close()
+        if not deleted:
+            return jsonify({'error': 'Không tìm thấy key'}), 404
+        return jsonify({'message': 'Deleted'}), 200
+    else:
+        if key in JSONDB.get('keys', {}):
+            del JSONDB['keys'][key]
+            _save(JSONDB)
+            return jsonify({'message': 'Deleted'}), 200
+        return jsonify({'error': 'Không tìm thấy key'}), 404
 
 
 # ─────────────────────────────────────────────────────────────
