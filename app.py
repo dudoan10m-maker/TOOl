@@ -23,7 +23,7 @@ CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v
 # (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
 # Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get('https://tool-7.onrender.com', '')
+DATABASE_URL = os.environ.get('DATABASE_URL', '')
 
 USE_DB = bool(DATABASE_URL)
 DB_ERROR = None  # ghi lại lỗi kết nối DB nếu có, để /api/status báo cho biết
@@ -570,6 +570,52 @@ def delete_account():
             return jsonify({'error': 'Không tìm thấy tài khoản'}), 404
         _save(JSONDB)
         return jsonify({'message': 'Deleted'}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# 7e. GET/POST /bank-config — Thông tin ngân hàng nhận tiền,
+# dùng để tool chính tạo VietQR động thay vì hardcode.
+# ─────────────────────────────────────────────────────────────
+@app.route('/bank-config', methods=['GET'])
+def get_bank_config():
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_code TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_name TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_stk TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_account_name TEXT")
+        conn.commit()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute('SELECT bank_code, bank_name, bank_stk, bank_account_name FROM settings WHERE id=1')
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        return jsonify({'bankCode': row['bank_code'], 'bankName': row['bank_name'], 'stk': row['bank_stk'], 'accountName': row['bank_account_name']}), 200
+    else:
+        b = JSONDB.get('bankConfig', {}) if not USE_DB else {}
+        return jsonify(b), 200
+
+@app.route('/bank-config', methods=['POST'])
+def set_bank_config():
+    data = request.json or {}
+    bank_code = data.get('bankCode')
+    bank_name = data.get('bankName')
+    stk = data.get('stk')
+    account_name = data.get('accountName')
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_code TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_name TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_stk TEXT")
+        cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS bank_account_name TEXT")
+        cur.execute('UPDATE settings SET bank_code=%s, bank_name=%s, bank_stk=%s, bank_account_name=%s WHERE id=1',
+                    (bank_code, bank_name, stk, account_name))
+        conn.commit(); cur.close(); conn.close()
+    else:
+        JSONDB['bankConfig'] = {'bankCode': bank_code, 'bankName': bank_name, 'stk': stk, 'accountName': account_name}
+        _save(JSONDB)
+    return jsonify({'bankCode': bank_code, 'bankName': bank_name, 'stk': stk, 'accountName': account_name}), 200
 
 
 if __name__ == '__main__':
