@@ -23,7 +23,7 @@ CORS(app)  # Cho phép frontend gọi từ mọi domain (Netlify, localhost, v.v
 # (data.json) như trước — chỉ để test local, KHÔNG bền vững trên
 # Render free tier.
 # ═══════════════════════════════════════════════════════════════
-DATABASE_URL = os.environ.get('https://tool-8.onrender.com', '')
+DATABASE_URL = os.environ.get(''https://tool-8.onrender.com' '')
 
 USE_DB = bool(DATABASE_URL)
 DB_ERROR = None  # ghi lại lỗi kết nối DB nếu có, để /api/status báo cho biết
@@ -79,6 +79,13 @@ if USE_DB:
         cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS sale_price BIGINT DEFAULT 0")
         cur.execute("ALTER TABLE settings ADD COLUMN IF NOT EXISTS sale_expiry BIGINT")
         cur.execute('INSERT INTO settings (id, locked, message) VALUES (1, FALSE, %s) ON CONFLICT (id) DO NOTHING', ('',))
+        # Bảng key-value tổng quát (game-config, v.v.)
+        cur.execute('''
+            CREATE TABLE IF NOT EXISTS kv_store (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        ''')
         conn.commit()
         cur.close()
         conn.close()
@@ -616,6 +623,86 @@ def set_bank_config():
         JSONDB['bankConfig'] = {'bankCode': bank_code, 'bankName': bank_name, 'stk': stk, 'accountName': account_name}
         _save(JSONDB)
     return jsonify({'bankCode': bank_code, 'bankName': bank_name, 'stk': stk, 'accountName': account_name}), 200
+
+
+# ─────────────────────────────────────────────────────────────
+# /api/game-config — Bật/tắt từng game + tính năng phân tích/link game
+# GET  → trả về config hiện tại
+# POST → {game: 'sunwin', enabled: true} hoặc {feature: 'analysis', enabled: false}
+# ─────────────────────────────────────────────────────────────
+DEFAULT_GAME_CONFIG = {
+    'games': {
+        'sunwin':  True,
+        '68game':  True,
+        'lc79':    True,
+        'hitclub': True,
+        'sao789':  True,
+    },
+    'features': {
+        'analysis':  True,
+        'gamelinks': True,
+    }
+}
+
+@app.route('/api/game-config', methods=['GET'])
+def get_game_config():
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        # Lưu trong bảng settings dưới key game_config (JSON string)
+        cur.execute("SELECT value FROM kv_store WHERE key='game_config'")
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        if row:
+            import json as _json
+            return jsonify(_json.loads(row['value'])), 200
+    # Fallback: JSON file
+    cfg = JSONDB.get('game_config', DEFAULT_GAME_CONFIG)
+    return jsonify(cfg), 200
+
+@app.route('/api/game-config', methods=['POST'])
+def set_game_config():
+    import json as _json, copy
+    data = request.json or {}
+
+    # Load current config
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT value FROM kv_store WHERE key='game_config'")
+        row = cur.fetchone()
+        cur.close(); conn.close()
+        cfg = _json.loads(row['value']) if row else copy.deepcopy(DEFAULT_GAME_CONFIG)
+    else:
+        cfg = JSONDB.get('game_config', copy.deepcopy(DEFAULT_GAME_CONFIG))
+
+    # Apply change
+    if 'game' in data:
+        if 'games' not in cfg:
+            cfg['games'] = {}
+        cfg['games'][data['game']] = bool(data.get('enabled', True))
+    elif 'feature' in data:
+        if 'features' not in cfg:
+            cfg['features'] = {}
+        cfg['features'][data['feature']] = bool(data.get('enabled', True))
+    else:
+        return jsonify({'ok': False, 'error': 'Thiếu field game hoặc feature'}), 400
+
+    # Save
+    if USE_DB and not DB_ERROR:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO kv_store(key,value) VALUES('game_config',%s) "
+            "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value",
+            (_json.dumps(cfg),)
+        )
+        conn.commit(); cur.close(); conn.close()
+    else:
+        JSONDB['game_config'] = cfg
+        _save(JSONDB)
+
+    return jsonify({'ok': True, 'config': cfg}), 200
 
 
 if __name__ == '__main__':
